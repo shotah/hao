@@ -1,0 +1,242 @@
+.SILENT: # Disable echo of commands
+ifneq ("$(wildcard .env)","")
+    include .env
+endif
+JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION := 1
+SHELL := /bin/bash
+export
+
+all: install test
+
+.PHONY : install
+install :
+	npm install
+	npm run test
+
+.PHONY: test
+test:
+	npm run test
+
+.PHONY: coverage
+coverage:
+	npm run coverage
+
+.PHONY: lint
+lint:
+	npm run lint
+
+.PHONY: fix
+fix:
+	npm run fix
+
+.PHONY: build
+build: install
+	npm run build
+
+.PHONY: start
+start: build
+	npm run function
+
+.PHONY: zip
+zip: 
+	npm run zip
+
+.PHONY: npm-upgrade
+npm-upgrade:
+	npm prune
+	npm list -g npm-check-updates || npm i -g npm-check-updates
+	npx ncu -u
+	npm update
+
+#####################
+# AWS CLI #
+#####################
+
+.PHONY: ecr-create
+ecr-create:
+	aws ecr create-repository \
+    	--repository-name mythos-api \
+    	--region us-east-1
+
+.PHONY: ecr-login
+ecr-login:
+	aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $(CDK_DEFAULT_ACCOUNT).dkr.ecr.us-east-1.amazonaws.com
+
+.PHONY: ecr-pull
+ecr-pull: ecr-login
+	docker pull $(CDK_DEFAULT_ACCOUNT).dkr.ecr.us-east-1.amazonaws.com/mythos-api:latest
+
+.PHONY: ecr-run
+ecr-run: ecr-pull
+	docker run -it --rm -p 80:80 --name mythos-api $(CDK_DEFAULT_ACCOUNT).dkr.ecr.us-east-1.amazonaws.com/mythos-api:latest
+
+#####################
+# PRISMA #
+#####################
+.PHONY: prisma-rebase
+prisma-rebase:
+# Dump all the migrations
+	-rm -rf ./prisma/migrations
+# Create a new migration
+	-mkdir -p ./prisma/migrations/000000000000_squashed_migrations
+# DANGER: This creates a full re-creation of the database
+	npx prisma migrate diff \
+ 		--from-empty \
+ 		--to-schema-datamodel ./prisma/schema.prisma \
+ 		--script > ./prisma/migrations/000000000000_squashed_migrations/migration.sql
+# NOTE: This marks it as applied!
+	-npx prisma migrate resolve \
+		--applied 000000000000_squashed_migrations
+# Create a new migration folder
+	-mkdir -p ./prisma/migrations/1_init
+# Create a new migration of the diff between the current schema and the database
+	npx prisma migrate diff \
+		--from-url $(DB_URL_SHORT) \
+		--to-schema-datamodel prisma/schema.prisma \
+		--script > prisma/migrations/1_init/migration.sql
+# Deploy the new migration diff! This will apply the migration to the database
+	npx prisma migrate deploy
+
+#####################
+# CDK Commands
+#####################
+
+# # Welcome to your CDK TypeScript project
+
+# You should explore the contents of this project. It demonstrates a CDK app with an instance of a stack (`SampleAppStack`)
+# which contains an Amazon SQS queue that is subscribed to an Amazon SNS topic.
+
+# The `cdk.json` file tells the CDK Toolkit how to execute your app.
+
+# ## Useful commands
+
+# * `npm run build`   compile typescript to js
+# * `npm run watch`   watch for changes and compile
+# * `npm run test`    perform the jest unit tests
+# * `cdk deploy`      deploy this stack to your default AWS account/region
+# * `cdk diff`        compare deployed stack with current state
+# * `cdk synth`       emits the synthesized CloudFormation template
+
+# initialize the CDK application -- only run once
+PHONY: cdk-init
+cdk-init:
+	cdk init sample-app --language typescript
+
+# install the CDK dependencies locally and sets up AWS account -- only run once
+# add --force to overwrite existing bootstrap and Upgrade bootstrap stack to bootstrap version 6
+PHONY: cdk-bootstrap
+cdk-bootstrap:
+	cdk bootstrap --force
+
+# Outputs the CloudFormation template for the CDK application
+PHONY: cdk-synth
+cdk-synth:
+	-rm ./cdk.context.json
+	cdk synth --validation
+
+# deploy the CDK application
+PHONY: cdk-deploy
+cdk-deploy: cdk-synth
+	cdk deploy --require-approval never
+
+# destroy the CDK application
+PHONY: cdk-destroy
+cdk-destroy:
+	cdk destroy -f
+
+# list the CDK application
+PHONY: cdk-list
+cdk-list:
+	cdk list
+
+# diff the CDK application
+PHONY: cdk-diff
+cdk-diff:
+	cdk diff
+
+# context the CDK application
+PHONY: cdk-context
+cdk-context:
+	cdk context
+
+# version the CDK application
+PHONY: cdk-version
+cdk-version:
+	cdk version
+
+#####################
+# DOCKER DB #
+#####################
+
+.PHONY: mock-db-format
+mock-db-format:
+	npx prisma validate
+	npx prisma generate
+	npx prisma db push --force-reset --accept-data-loss
+
+.PHONY: mock-db-start
+mock-db-start:
+	docker run -d --rm \
+		--name mythos-db \
+		-p 5432:5432 \
+		-e POSTGRES_DB=$(DB_NAME) \
+		-e POSTGRES_USER=$(DB_USERNAME) \
+		-e POSTGRES_PASSWORD=$(DB_PASSWORD) \
+		postgres:alpine
+
+.PHONY: mock-db-stop
+mock-db-stop:
+	docker stop mythos-db
+
+.PHONY: mock-db
+mock-db: mock-db-start mock-db-format
+
+#####################
+# DOCKER API #
+#####################
+
+DOCKER_IMAGE_NAME := "mythos-api"
+
+# Deployment: Build the image with the deployment stage
+
+.PHONY: build-no-cache
+build-no-cache:
+	docker build --no-cache -t $(DOCKER_IMAGE_NAME) .
+
+.PHONY: docker-build
+docker-build:
+	docker build -t $(DOCKER_IMAGE_NAME) .
+
+.PHONY: docker-run
+docker-run: docker-build
+	docker run -it --rm -p 443:443 --name $(DOCKER_IMAGE_NAME) $(DOCKER_IMAGE_NAME)
+
+.PHONY: docker-run-detached
+docker-run-detached: docker-build
+	docker run -d -p 443:443 --name $(DOCKER_IMAGE_NAME) $(DOCKER_IMAGE_NAME)
+
+.PHONY: docker-destroy
+docker-destroy:
+	docker stop $(DOCKER_IMAGE_NAME)
+	docker rm $(DOCKER_IMAGE_NAME)
+
+
+.PHONY: docker-run-dev
+docker-run-dev: docker-build
+	docker run -it --rm \
+		-p 443:443 \
+		-e DB_HOST=localhost \
+		--name $(DOCKER_IMAGE_NAME) \
+		-v ./src,/usr/src/app/src \
+		-v ./prisma,/usr/src/ap/prisma \
+		-v ./scripts,/usr/src/ap/scripts \
+		$(DOCKER_IMAGE_NAME)
+
+.PHONY: compose
+compose:
+	docker-compose rm -f
+	docker-compose up --build
+
+.PHONY: down
+down:
+	docker-compose down
